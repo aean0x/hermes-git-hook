@@ -17,7 +17,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test dependencies
-        run: python -m pip install pytest==8.3.4
+      # stdlib only: the suite must run wherever the plugin runs.
       - name: Run tests
-        run: python -m pytest tests/ -q
+        run: python -m unittest discover -s tests -t . -v
