@@ -1,0 +1,22 @@
+name: git-hook
+version: 0.4.0
+description: >-
+  Auto fetch/pull before reads, and commit + push only the files this turn
+  changed, for any git worktree Hermes touches. Stale paths (atomic-write
+  `.hermes-tmp.*` temps, files created and deleted inside one turn) are
+  dropped before `git add` — one dead pathspec used to fail the whole batch
+  and leave every real change of the turn uncommitted. The plugin install
+  tree itself is never synced. Failures surface in-session (not log-only);
+  busy/push-fail retries. Git subprocesses never run under the module lock,
+  so one session's slow pull/porcelain cannot stall every session's
+  post_tool_call hook (prevents "skipped after previous timeout" cascades).
+  The agent's own secrets, state, caches and logs are never staged.
+  No tools, no scripts. Disable commits with GIT_HOOK_COMMIT=0, push with
+  GIT_HOOK_PUSH=0.
+author: aean0x
+kind: standalone
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - post_llm_call
+  - on_session_end
