@@ -55,6 +55,24 @@ _PATCH_FILE_RE = re.compile(
 )
 _FALSE = frozenset({"0", "false", "no", "off", ""})
 
+# A push the remote refuses for POLICY reasons — branch protection, a ruleset,
+# a server-side pre-receive check — can never succeed on a retry: the branch is
+# closed to direct pushes. Without this the hook re-commits and re-pushes on
+# every pass, the branch stays ahead of its upstream for good (which also breaks
+# the ff-only pull), and the same remote error is logged on every flush. Such a
+# rejection is terminal for that branch. Transient failures (network, auth,
+# timeout) keep the existing "committed_local_only + retry" contract.
+_STRUCTURAL_PUSH_RE = re.compile(
+    r"\bGH0\d{2}\b"
+    r"|protected branch"
+    r"|refusing to update checked out branch"
+    r"|hook declined to update"
+    r"|must be made through a pull request"
+    r"|required status check"
+    r"|pre-receive hook declined",
+    re.IGNORECASE,
+)
+
 # write_file/patch land content via a same-directory atomic rename. Their temp
 # names (`.hermes-tmp.XXXXXX`, plus the webui `.name.hermes-tmp-<pid>` form) are
 # visible to post_tool_call but gone by flush time, and one dead pathspec makes
@@ -70,6 +88,14 @@ _before: Dict[str, "Dict[str, PathSig]"] = {}
 _dirty: Dict[str, Set[str]] = {}
 _unpushed: Set[str] = set()
 _root_cache: Dict[str, Optional[str]] = {}
+# (root, branch) whose upstream refused a direct push on policy grounds. Learned
+# from the rejection itself — never guessed, never persisted: a process restart
+# re-tests the branch once. A persisted memo would outlive the ruleset it came
+# from and silently keep refusing a branch that had become pushable again.
+_protected: Set[Tuple[str, str]] = set()
+# (root, branch) already reported to the operator by this process: the warning
+# is per branch, not per flush.
+_policy_noted: Set[Tuple[str, str]] = set()
 
 # Flush outcomes that must put paths back on _dirty (commit never landed).
 _RETRY_DIRTY = frozenset(
@@ -373,6 +399,100 @@ def _has_upstream(root: str) -> bool:
     return proc.returncode == 0 and bool((proc.stdout or "").strip())
 
 
+def _branch(root: str) -> str:
+    """Checked-out branch name; "HEAD" when detached, "" if unresolvable."""
+    try:
+        proc = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root, timeout=3)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _head_sha(root: str) -> str:
+    """Full HEAD sha, "" on an unborn branch."""
+    try:
+        proc = _git(["rev-parse", "HEAD"], cwd=root, timeout=3)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _policy_rejection(stderr: str) -> bool:
+    """True when the remote refused the push because of branch policy."""
+    return bool(_STRUCTURAL_PUSH_RE.search(stderr or ""))
+
+
+def _status_branch(status: str) -> str:
+    """Branch field of a `protected <branch>` / `protected-stranded <branch>`."""
+    parts = status.split(" ", 1)
+    return parts[1] if len(parts) > 1 and parts[1] else "HEAD"
+
+
+def _protected_branch(root: str, branch: str) -> bool:
+    with _lock:
+        return bool(branch) and (root, branch) in _protected
+
+
+def _mark_protected(root: str, branch: str) -> None:
+    if not branch:
+        return
+    with _lock:
+        _protected.add((root, branch))
+
+
+def _note_policy_once(root: str, branch: str) -> bool:
+    """True the first time this process reports `branch` as push-closed."""
+    with _lock:
+        key = (root, branch)
+        if key in _policy_noted:
+            return False
+        _policy_noted.add(key)
+        return True
+
+
+def _undo_own_commit(root: str, prev_sha: str, sha: str) -> bool:
+    """Drop the commit this hook just made, keeping its content staged.
+
+    Only called after the branch's push was refused by policy, i.e. the commit
+    exists nowhere but this clone, and only when HEAD is still provably the
+    commit this pass created — a commit that appeared meanwhile (another
+    session, a human) is never touched. `--soft` leaves the paths staged, so the
+    edit stays in the working tree instead of being silently reverted.
+    """
+    if not prev_sha or not sha:
+        return False
+    if _head_sha(root) != sha:
+        log.info("git-hook: HEAD moved since %s; leaving history alone", sha[:9])
+        return False
+    try:
+        back = _git(["reset", "--soft", prev_sha], cwd=root, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if back.returncode != 0:
+        log.warning(
+            "git-hook: could not undo own commit %s (%s)",
+            sha[:9],
+            (back.stderr or "").strip()[:200],
+        )
+        return False
+    log.info("git-hook: undid own unpushable commit %s; paths stay staged", sha[:9])
+    return True
+
+
+def _paths_hint(paths: Iterable[str]) -> Optional[str]:
+    """Short file list for an operator-facing note."""
+    names = [Path(p).name for p in sorted(paths) if p]
+    if not names:
+        return None
+    if len(names) <= 3:
+        return ", ".join(names)
+    return ", ".join(names[:3]) + f" (+{len(names) - 3} more)"
+
+
 def _with_repo_lock(root: str):
     git_dir = Path(root) / ".git"
     if git_dir.is_file():
@@ -441,10 +561,17 @@ def _commit_message(paths: Iterable[str]) -> str:
 
 
 def _push(root: str, source: str, sha: str) -> str:
-    """Push HEAD. Fail-open; caller owns dirty/unpushed bookkeeping."""
+    """Push HEAD. Fail-open; caller owns dirty/unpushed bookkeeping.
+
+    A policy rejection returns `protected <branch>` and is remembered, so the
+    branch is not pushed (or committed to) again in this process.
+    """
     if not _truthy("GIT_HOOK_PUSH", True):
         log.info("git-hook [%s]: committed %s (push off)", source, sha)
         return f"committed {sha}"
+    branch = _branch(root)
+    if _protected_branch(root, branch):
+        return f"protected {branch or 'HEAD'}"
     timeout = _timeout("GIT_HOOK_PUSH_TIMEOUT_S", 20)
     try:
         if not _has_upstream(root):
@@ -458,12 +585,18 @@ def _push(root: str, source: str, sha: str) -> str:
         log.warning("git-hook [%s]: committed %s, push error %s", source, sha, exc)
         return f"committed_local_only {sha}"
     if push.returncode != 0:
-        log.warning(
-            "git-hook [%s]: committed %s, push failed %s",
-            source,
-            sha,
-            (push.stderr or "").strip()[:200],
-        )
+        err = (push.stderr or "").strip()[:200]
+        if _policy_rejection(push.stderr or ""):
+            _mark_protected(root, branch)
+            log.warning(
+                "git-hook [%s]: %s rejects direct pushes (policy: %s); %s stays local",
+                source,
+                branch or "HEAD",
+                err[:120],
+                sha,
+            )
+            return f"protected {branch or 'HEAD'}"
+        log.warning("git-hook [%s]: committed %s, push failed %s", source, sha, err)
         return f"committed_local_only {sha}"
     log.info("git-hook [%s]: pushed %s", source, sha)
     return f"pushed {sha}"
@@ -518,8 +651,20 @@ def commit_and_push(root: str, paths: Set[str], source: str) -> str:
     rels = _stageable(root, rels)
     if not rels:
         return "clean"
+    # A branch whose direct push was already refused by policy is closed: a new
+    # commit here would only be stranded — and re-logged — again. Keep the paths
+    # dirty instead, so the edit stays visible to a human.
+    branch = _branch(root)
+    if _protected_branch(root, branch):
+        log.info(
+            "git-hook: %s rejects direct pushes; %d path(s) left uncommitted",
+            branch,
+            len(rels),
+        )
+        return f"protected {branch or 'HEAD'}"
     try:
         with _with_repo_lock(root):
+            prev_sha = _head_sha(root)
             add = _git(["add", "--", *rels], cwd=root, timeout=10)
             if add.returncode != 0:
                 log.warning(
@@ -551,7 +696,13 @@ def commit_and_push(root: str, paths: Set[str], source: str) -> str:
                 log.warning("git-hook: commit skipped %s (%s)", root, err)
                 return "commit-skipped"
             sha = (_git(["rev-parse", "--short", "HEAD"], cwd=root, timeout=3).stdout or "").strip()
-            return _push(root, source, sha)
+            status = _push(root, source, sha)
+            if status.startswith("protected"):
+                # Nobody has this commit but this clone: drop it again, content
+                # staged, instead of leaving the branch ahead of its upstream.
+                if not _undo_own_commit(root, prev_sha, _head_sha(root)):
+                    return f"protected-stranded {_branch(root) or 'HEAD'}"
+            return status
     except OSError:
         return "locked"
     except subprocess.TimeoutExpired:
@@ -636,7 +787,7 @@ def on_post_tool_call(
             _before[root] = after
 
 
-def _note(root: str, status: str) -> Optional[str]:
+def _note(root: str, status: str, hint: Optional[str] = None) -> Optional[str]:
     short = Path(root).name
     if status in {"busy", "locked", "timeout"}:
         return f"{short}: {status} — git-hook will retry"
@@ -646,7 +797,27 @@ def _note(root: str, status: str) -> Optional[str]:
         return f"{short}: commit skipped (identity/hook). Files stay uncommitted."
     if status.startswith("committed_local_only"):
         return f"{short}: committed locally but push failed. git-hook will retry push."
+    if status.startswith("protected-stranded"):
+        return (
+            f"{short}: origin rejects direct pushes to {_status_branch(status)} "
+            "(a PR is required) — a local commit stays unpushed. Move it to a "
+            "branch and open a PR."
+        )
+    if status.startswith("protected"):
+        files = hint or "the turn's file(s)"
+        return (
+            f"{short}: origin rejects direct pushes to {_status_branch(status)} "
+            f"(a PR is required) — git-hook left {files} uncommitted and pushed "
+            "nothing. Put them on a branch and open a PR."
+        )
     return None
+
+
+def _may_note(root: str, status: str) -> bool:
+    """Policy notes are per branch per process; every other note repeats."""
+    if not status.startswith("protected"):
+        return True
+    return _note_policy_once(root, _status_branch(status))
 
 
 def _flush(source: str) -> Optional[str]:
@@ -663,13 +834,17 @@ def _flush(source: str) -> Optional[str]:
         except Exception:
             log.exception("git-hook: flush failed %s", root)
             status = "timeout"
-        note = _note(root, status)
+        note = _note(root, status, _paths_hint(paths))
+        if note and not _may_note(root, status):
+            note = None
         if note:
             notes.append(note)
         with _lock:
             if status in _RETRY_DIRTY:
                 _dirty.setdefault(root, set()).update(paths)
-            if status.startswith("committed_local_only"):
+            if status.startswith("committed_local_only") or status.startswith(
+                "protected-stranded"
+            ):
                 _unpushed.add(root)
             elif status.startswith("pushed") or status.startswith("committed "):
                 _unpushed.discard(root)
@@ -684,7 +859,12 @@ def _flush(source: str) -> Optional[str]:
         except Exception:
             log.exception("git-hook: push retry failed %s", root)
             continue
+        if status.startswith("protected"):
+            # Short-circuited on the policy memo; a commit is stranded here.
+            status = f"protected-stranded {_status_branch(status)}"
         note = _note(root, status)
+        if note and not _may_note(root, status):
+            note = None
         if note:
             notes.append(note)
         with _lock:
@@ -722,6 +902,8 @@ def reset_state() -> None:
         _dirty.clear()
         _unpushed.clear()
         _root_cache.clear()
+        _protected.clear()
+        _policy_noted.clear()
 
 
 def register(ctx) -> None:
