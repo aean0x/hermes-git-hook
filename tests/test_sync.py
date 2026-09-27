@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import sync
 
@@ -358,6 +358,306 @@ class TransientPaths(unittest.TestCase):
         ).stdout
         self.assertIn("real.txt", log)
         self.assertNotIn("transient-scratch.txt", log)
+
+
+INCIDENT_STDERR = (
+    # Captured verbatim from a real GitHub refusal of a direct push to
+    # `main` of aean0x/rk3588-nixos-nas (ruleset `openclaw-pr`, 2026-09-21).
+    "remote: error: GH013: Repository rule violations found for refs/heads/main.\n"
+    "remote: Review all repository rules at "
+    "https://github.com/aean0x/rk3588-nixos-nas/rules?ref=refs%2Fheads%2Fmain\n"
+    "remote: \n"
+    "remote: - Changes must be made through a pull request.\n"
+    "remote: \n"
+    "To https://github.com/aean0x/rk3588-nixos-nas.git\n"
+    " ! [remote rejected] HEAD -> main (push declined due to repository rule violations)\n"
+    "error: failed to push some refs to 'https://github.com/aean0x/rk3588-nixos-nas.git'"
+)
+
+
+class PushRejectionClass(unittest.TestCase):
+    """Only a policy refusal is terminal; a network/auth failure must still
+    keep the existing commit-and-retry contract."""
+
+    def test_real_gh013_text_is_policy(self):
+        """Verbatim stderr from the 2026-09-21 strand incident."""
+        self.assertTrue(sync._policy_rejection(INCIDENT_STDERR))
+
+    def test_other_remote_policy_rejections_are_policy(self):
+        self.assertTrue(
+            sync._policy_rejection(
+                "remote: error: GH006: Protected branch update failed for refs/heads/main."
+            )
+        )
+        self.assertTrue(
+            sync._policy_rejection(
+                "remote: error: refusing to update checked out branch: refs/heads/main"
+            )
+        )
+        self.assertTrue(
+            sync._policy_rejection(
+                "remote: error: Required status check \"lint\" is expected.\n"
+                "remote: error: hook declined to update refs/heads/main"
+            )
+        )
+
+    def test_transient_failures_are_not_policy(self):
+        for text in (
+            "fatal: unable to access 'https://github.com/x/y.git/':"
+            " Could not resolve host: github.com",
+            "remote: Invalid username or password.\n"
+            "fatal: Authentication failed for 'https://github.com/x/y.git/'",
+            "fatal: the remote end hung up unexpectedly",
+            "fatal: '/nonexistent/missing.git' does not appear to be a git repository",
+            "fatal: unable to write new index file",
+            "",
+        ):
+            self.assertFalse(sync._policy_rejection(text), text)
+
+
+class ProtectedBranch(unittest.TestCase):
+    """PR-protected branches must never accumulate hook commits.
+
+    The incident this encodes: the hook committed onto a PR-protected `main`,
+    the push was refused (GH013), and every later pass re-committed and
+    re-pushed — stranding commits on `main` (breaking the ff-only pull) and
+    re-logging the same remote error 30 times in one day.
+    """
+
+    def setUp(self):
+        sync.reset_state()
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        os.environ["PROJECTS_ROOT"] = str(self.root)
+        os.environ.pop("GIT_HOOK_PUSH", None)
+        os.environ.pop("GIT_HOOK_COMMIT", None)
+        self.bare, self.work = self._clone_pair()
+        self.counter = self.root / "push-attempts"
+
+    def tearDown(self):
+        sync.reset_state()
+        os.environ.pop("PROJECTS_ROOT", None)
+        os.environ.pop("GIT_HOOK_PUSH", None)
+        self.td.cleanup()
+
+    def _clone_pair(self):
+        origin = _init_repo(self.root / "origin")
+        bare = self.root / "origin.git"
+        _git(["clone", "--bare", str(origin), str(bare)], cwd=self.root)
+        work = self.root / "work"
+        _git(["clone", str(bare), str(work)], cwd=self.root)
+        _git(["config", "user.name", "dev"], cwd=work)
+        _git(["config", "user.email", "dev@example.com"], cwd=work)
+        return bare, work
+
+    def _deny_pushes(self, remote_line):
+        """Remote-side refusal, the way GitHub states a ruleset rejection."""
+        hook = self.bare / "hooks" / "pre-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            f"echo attempt >> {self.counter}\n"
+            f"echo 'remote: error: {remote_line}' >&2\n"
+            "exit 1\n"
+        )
+        hook.chmod(0o755)
+        if not os.access(hook, os.X_OK):
+            self.skipTest("temp dir is noexec; the remote hook cannot run")
+
+    def _allow_pushes(self):
+        hook = self.bare / "hooks" / "pre-receive"
+        if hook.exists():
+            hook.unlink()
+
+    def _attempts(self):
+        if not self.counter.exists():
+            return 0
+        return len(self.counter.read_text().split())
+
+    def _head(self):
+        return _git(["rev-parse", "HEAD"], cwd=self.work).stdout.strip()
+
+    def _commits(self):
+        return _git(["rev-list", "--count", "HEAD"], cwd=self.work).stdout.strip()
+
+    def test_policy_rejection_leaves_no_stranded_commit(self):
+        self._deny_pushes("GH013: Repository rule violations found for refs/heads/main.")
+        before = self._head()
+        (self.work / "notes.txt").write_text("turn work\n")
+
+        status = sync.commit_and_push(str(self.work), {"notes.txt"}, "test")
+
+        self.assertTrue(status.startswith("protected "), status)
+        self.assertEqual(self._head(), before)  # the hook's own commit is gone
+        self.assertEqual(self._commits(), "1")
+        # ... and the edit is still there, staged, for a human to PR.
+        self.assertIn("notes.txt", _git(["status", "--porcelain"], cwd=self.work).stdout)
+        self.assertEqual(self._attempts(), 1)
+        self.assertEqual(
+            _git(["rev-parse", "main"], cwd=self.bare).stdout.strip(),
+            _git(["rev-parse", "main"], cwd=self.work).stdout.strip(),
+        )
+
+    def test_later_turns_do_not_push_the_closed_branch_again(self):
+        self._deny_pushes("GH013: Repository rule violations found for refs/heads/main.")
+        (self.work / "a.txt").write_text("one\n")
+        sync.commit_and_push(str(self.work), {"a.txt"}, "test")
+        before = self._head()
+        (self.work / "b.txt").write_text("two\n")
+
+        status = sync.commit_and_push(str(self.work), {"b.txt"}, "test")
+
+        self.assertTrue(status.startswith("protected "), status)
+        self.assertEqual(self._head(), before)
+        self.assertEqual(self._attempts(), 1)  # no second push attempt
+        self.assertIn("b.txt", _git(["status", "--porcelain"], cwd=self.work).stdout)
+
+    def test_a_feature_branch_is_not_affected(self):
+        self._deny_pushes("GH013: Repository rule violations found for refs/heads/main.")
+        (self.work / "a.txt").write_text("one\n")
+        sync.commit_and_push(str(self.work), {"a.txt"}, "test")
+        self.assertIn((str(self.work), "main"), sync._protected)
+
+        _git(["switch", "-c", "feat/x"], cwd=self.work)
+        _git(["commit", "-m", "carry the work over"], cwd=self.work)
+        self._allow_pushes()
+        (self.work / "b.txt").write_text("two\n")
+
+        status = sync.commit_and_push(str(self.work), {"b.txt"}, "test")
+
+        self.assertIn("pushed", status)
+        pushed = _git(
+            ["show", "--pretty=format:", "--name-only", "feat/x"], cwd=self.bare
+        ).stdout
+        self.assertIn("b.txt", pushed)
+
+    def test_transient_push_failure_still_keeps_the_commit(self):
+        _git(
+            ["remote", "set-url", "origin", str(self.root / "missing.git")],
+            cwd=self.work,
+        )
+        (self.work / "note.txt").write_text("ours\n")
+
+        status = sync.commit_and_push(str(self.work), {"note.txt"}, "test")
+
+        self.assertTrue(status.startswith("committed_local_only"), status)
+        self.assertEqual(self._commits(), "2")  # the commit is kept, for a retry
+        self.assertNotIn((str(self.work), "main"), sync._protected)
+
+    def test_policy_note_is_reported_once_per_branch(self):
+        self._deny_pushes("GH013: Repository rule violations found for refs/heads/main.")
+        target = self.work / "touched.txt"
+        sync.on_pre_tool_call("write_file", {"path": str(target)})
+        target.write_text("ours\n")
+        sync.on_post_tool_call("write_file", {"path": str(target)}, status="ok")
+
+        first = sync.on_post_llm_call()
+
+        self.assertIsNotNone(first)
+        self.assertIn("rejects direct pushes to main", first["context"])
+        self.assertIn("touched.txt", first["context"])
+
+        more = self.work / "more.txt"
+        sync.on_pre_tool_call("write_file", {"path": str(more)})
+        more.write_text("more\n")
+        sync.on_post_tool_call("write_file", {"path": str(more)}, status="ok")
+
+        self.assertIsNone(sync.on_post_llm_call())  # one warning, not one per turn
+        self.assertEqual(self._attempts(), 1)
+
+    def test_stranded_commits_stop_being_retried(self):
+        """The GH013 storm: a commit already stranded on the branch must not be
+        re-pushed (and re-logged) on every flush."""
+        self._deny_pushes("GH013: Repository rule violations found for refs/heads/main.")
+        (self.work / "stranded.txt").write_text("stranded\n")
+        _git(["add", "stranded.txt"], cwd=self.work)
+        _git(["commit", "-m", "stranded"], cwd=self.work)
+        sync._unpushed.add(str(self.work))
+
+        first = sync.on_post_llm_call()
+
+        self.assertIsNotNone(first)
+        self.assertIn("a local commit stays unpushed", first["context"])
+        self.assertEqual(self._attempts(), 1)
+
+        self.assertIsNone(sync.on_post_llm_call())
+        self.assertEqual(self._attempts(), 1)
+
+    def test_undo_refuses_to_touch_a_commit_it_did_not_make(self):
+        (self.work / "manual.txt").write_text("by hand\n")
+        _git(["add", "manual.txt"], cwd=self.work)
+        _git(["commit", "-m", "by hand"], cwd=self.work)
+        head = self._head()
+        parent = _git(["rev-parse", "HEAD~1"], cwd=self.work).stdout.strip()
+
+        # HEAD is not the commit the hook claims it just made: leave it alone.
+        self.assertFalse(sync._undo_own_commit(str(self.work), parent, "0" * 40))
+
+        self.assertEqual(self._head(), head)
+        self.assertIn(
+            "manual.txt",
+            _git(["show", "--pretty=format:", "--name-only", "HEAD"], cwd=self.work).stdout,
+        )
+
+    def test_undo_keeps_the_content_staged(self):
+        before = self._head()
+        (self.work / "x.txt").write_text("x\n")
+        _git(["add", "x.txt"], cwd=self.work)
+        _git(["commit", "-m", "hook commit"], cwd=self.work)
+        head = self._head()
+
+        self.assertTrue(sync._undo_own_commit(str(self.work), before, head))
+
+        self.assertEqual(self._head(), before)
+        self.assertIn("A  x.txt", _git(["status", "--porcelain"], cwd=self.work).stdout)
+
+
+class DeadCwd(unittest.TestCase):
+    """A cwd deleted under the process must be a no-op, never a refused call.
+
+    os.getcwd() raises FileNotFoundError once the directory the process sits in
+    is gone — the normal end state of a kanban worker whose scratch workspace
+    drains under it. An exception escaping a tool-call callback is not a no-op:
+    the plugin manager refuses the tool call, which is how a dead cwd cost three
+    `terminal` calls and one `execute_code` call (2026-09-26).
+    """
+
+    def setUp(self):
+        sync.reset_state()
+        self.original = os.getcwd()
+        self.td = tempfile.TemporaryDirectory()
+        self.gone = Path(self.td.name) / "gone"
+        self.gone.mkdir()
+        os.chdir(self.gone)
+        os.rmdir(self.gone)
+
+    def tearDown(self):
+        os.chdir(self.original)
+        sync.reset_state()
+        self.td.cleanup()
+
+    def test_cwd_helper_returns_none_when_cwd_is_gone(self):
+        self.assertIsNone(sync._cwd())
+        self.assertEqual(sync.extract_paths("terminal", {"command": "true"}), [])
+
+    def test_cwd_helper_returns_live_cwd(self):
+        live = Path(self.td.name) / "live"
+        live.mkdir()
+        os.chdir(live)
+        self.assertEqual(sync._cwd(), str(live.resolve()))
+
+    def test_tool_call_hooks_survive_a_dead_cwd(self):
+        sync.on_pre_tool_call("terminal", {"command": "true"})
+        sync.on_pre_tool_call("execute_code", {"code": "print(1)"})
+        sync.on_post_tool_call("terminal", {"command": "true"}, status="ok")
+        self.assertEqual(sync._roots_for("terminal", {"command": "true"}), [])
+        self.assertEqual(sync._dirty, {})
+
+    def test_hook_guard_swallows_a_raising_body(self):
+        """Fail open: a callback that raises must not reach the plugin manager."""
+        with patch.object(sync, "_snapshot_and_pull", side_effect=OSError("dead fs")):
+            sync.on_pre_tool_call("terminal", {"command": "true"})
+        with patch.object(sync, "_record_delta", side_effect=OSError("dead fs")):
+            sync.on_post_tool_call("terminal", {"command": "true"}, status="ok")
 
 
 if __name__ == "__main__":
