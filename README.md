@@ -58,6 +58,11 @@ Falsy values are `0`, `false`, `no`, `off` and the empty string.
   will not pull or commit it away from that commit.
 - Run git under its module lock. One session's slow pull cannot make another
   session's `post_tool_call` callback look "still running" and get skipped.
+- Refuse a tool call. The hook is fail-open end to end: a deleted cwd, an
+  unreadable path argument, or a raising git subprocess leaves that turn
+  unsynced instead of failing the callback — an exception escaping a
+  `pre_tool_call`/`post_tool_call` callback makes the plugin manager refuse the
+  tool call outright, which is real work lost to a housekeeping hook.
 
 ## Branches that reject direct pushes
 

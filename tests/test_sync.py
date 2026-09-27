@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import sync
 
@@ -609,6 +609,55 @@ class ProtectedBranch(unittest.TestCase):
 
         self.assertEqual(self._head(), before)
         self.assertIn("A  x.txt", _git(["status", "--porcelain"], cwd=self.work).stdout)
+
+
+class DeadCwd(unittest.TestCase):
+    """A cwd deleted under the process must be a no-op, never a refused call.
+
+    os.getcwd() raises FileNotFoundError once the directory the process sits in
+    is gone — the normal end state of a kanban worker whose scratch workspace
+    drains under it. An exception escaping a tool-call callback is not a no-op:
+    the plugin manager refuses the tool call, which is how a dead cwd cost three
+    `terminal` calls and one `execute_code` call (2026-09-26).
+    """
+
+    def setUp(self):
+        sync.reset_state()
+        self.original = os.getcwd()
+        self.td = tempfile.TemporaryDirectory()
+        self.gone = Path(self.td.name) / "gone"
+        self.gone.mkdir()
+        os.chdir(self.gone)
+        os.rmdir(self.gone)
+
+    def tearDown(self):
+        os.chdir(self.original)
+        sync.reset_state()
+        self.td.cleanup()
+
+    def test_cwd_helper_returns_none_when_cwd_is_gone(self):
+        self.assertIsNone(sync._cwd())
+        self.assertEqual(sync.extract_paths("terminal", {"command": "true"}), [])
+
+    def test_cwd_helper_returns_live_cwd(self):
+        live = Path(self.td.name) / "live"
+        live.mkdir()
+        os.chdir(live)
+        self.assertEqual(sync._cwd(), str(live.resolve()))
+
+    def test_tool_call_hooks_survive_a_dead_cwd(self):
+        sync.on_pre_tool_call("terminal", {"command": "true"})
+        sync.on_pre_tool_call("execute_code", {"code": "print(1)"})
+        sync.on_post_tool_call("terminal", {"command": "true"}, status="ok")
+        self.assertEqual(sync._roots_for("terminal", {"command": "true"}), [])
+        self.assertEqual(sync._dirty, {})
+
+    def test_hook_guard_swallows_a_raising_body(self):
+        """Fail open: a callback that raises must not reach the plugin manager."""
+        with patch.object(sync, "_snapshot_and_pull", side_effect=OSError("dead fs")):
+            sync.on_pre_tool_call("terminal", {"command": "true"})
+        with patch.object(sync, "_record_delta", side_effect=OSError("dead fs")):
+            sync.on_post_tool_call("terminal", {"command": "true"}, status="ok")
 
 
 if __name__ == "__main__":
