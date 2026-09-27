@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
 
 log = logging.getLogger("plugins.git_hook")
 
@@ -176,6 +176,21 @@ def _existing_path(value: Any) -> Optional[str]:
     return None
 
 
+def _cwd() -> Optional[str]:
+    """The process working directory, or None when that directory is gone.
+
+    `os.getcwd()` raises FileNotFoundError (ENOENT) once the directory the
+    process was started in has been removed — the normal end state of a kanban
+    worker whose scratch workspace drains under it. A dead cwd means there is
+    nothing to pull and nothing to snapshot, so the hook's answer is "no path",
+    never an error.
+    """
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
 def extract_paths(tool_name: str, args: Optional[Dict[str, Any]]) -> list[str]:
     """Filesystem paths a tool is about to touch. Conservative."""
     args = args if isinstance(args, dict) else {}
@@ -200,7 +215,9 @@ def extract_paths(tool_name: str, args: Optional[Dict[str, Any]]) -> list[str]:
                 _add(match.group(1).strip())
 
     if tool_name in {"terminal", "execute_code"} and not found:
-        _add(os.getcwd())
+        # No path argument: fall back to the process cwd. A deleted cwd yields
+        # None here (_cwd), which _add ignores — never an exception.
+        _add(_cwd())
     return found
 
 
@@ -562,12 +579,34 @@ def commit_and_push(root: str, paths: Set[str], source: str) -> str:
 def _roots_for(tool_name: str, args: Optional[Dict[str, Any]]) -> list[str]:
     roots: list[str] = []
     seen: Set[str] = set()
-    for path in extract_paths(tool_name, args):
+    try:
+        paths = extract_paths(tool_name, args)
+    except OSError:
+        # Path extraction is best-effort: an unreadable/dead path must leave
+        # this turn unsynced, not fail the tool call that triggered it.
+        log.debug("git-hook: path extraction failed for %s", tool_name, exc_info=True)
+        return roots
+    for path in paths:
         root = git_root(path)
         if root and root not in seen:
             seen.add(root)
             roots.append(root)
     return roots
+
+
+def _hook_guard(name: str, body: Callable[[], None]) -> None:
+    """Run one tool-call callback body; never let a failure reach the manager.
+
+    An exception escaping a tool-call callback is not a no-op: the plugin
+    manager records a callback failure and REFUSES the tool call, so an
+    optional sync hook costs real work when it trips (a deleted cwd lost three
+    `terminal` calls and one `execute_code` call on 2026-09-26). Fail open;
+    the traceback goes to the log.
+    """
+    try:
+        body()
+    except Exception:
+        log.warning("git-hook: %s failed; tool call proceeds", name, exc_info=True)
 
 
 def on_pre_tool_call(
@@ -577,6 +616,10 @@ def on_pre_tool_call(
 ) -> None:
     if disabled():
         return
+    _hook_guard("pre_tool_call", lambda: _snapshot_and_pull(tool_name, args))
+
+
+def _snapshot_and_pull(tool_name: str, args: Optional[Dict[str, Any]]) -> None:
     # Writes still record a before-snapshot; pull only on non-write.
     do_pull = tool_name not in _WRITE_TOOLS
     roots = _roots_for(tool_name, args)
@@ -612,6 +655,10 @@ def on_post_tool_call(
         return
     if status in {"blocked"}:
         return
+    _hook_guard("post_tool_call", lambda: _record_delta(tool_name, args))
+
+
+def _record_delta(tool_name: str, args: Optional[Dict[str, Any]]) -> None:
     roots = _roots_for(tool_name, args)
     if not roots:
         return
