@@ -1,5 +1,5 @@
 name: git-hook
-version: 0.5.0
+version: 0.5.1
 description: >-
   Auto fetch/pull before reads, and commit + push only the files this turn
   changed, for any git worktree Hermes touches. Stale paths (atomic-write
