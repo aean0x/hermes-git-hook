@@ -43,6 +43,11 @@ def _init_repo(path: Path, *, name="dev", email="dev@example.com") -> Path:
     _git(["init", "-b", "main"], cwd=path)
     _git(["config", "user.name", name], cwd=path)
     _git(["config", "user.email", email], cwd=path)
+    # No background maintenance: `git gc --auto` and maintenance run after these
+    # commands and keep writing into .git while TemporaryDirectory.cleanup() is
+    # already walking it, which fails the teardown with "Directory not empty".
+    _git(["config", "gc.auto", "0"], cwd=path)
+    _git(["config", "maintenance.auto", "false"], cwd=path)
     (path / "README").write_text("hello\n")
     _git(["add", "README"], cwd=path)
     _git(["commit", "-m", "init"], cwd=path)
@@ -51,14 +56,14 @@ def _init_repo(path: Path, *, name="dev", email="dev@example.com") -> Path:
 
 class ExtractPaths(unittest.TestCase):
     def test_read_file_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             target = Path(tmp) / "a.txt"
             target.write_text("x")
             paths = sync.extract_paths("read_file", {"path": str(target)})
             self.assertEqual(paths, [str(target.resolve())])
 
     def test_patch_header_paths(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             target = Path(tmp) / "mod.py"
             target.write_text("x")
             patch = f"*** Update File: {target}\n@@\n-x\n+y\n"
@@ -78,7 +83,7 @@ class SkipRules(unittest.TestCase):
         self.assertTrue(sync._skipped("/tmp/foo"))
 
     def test_hermes_home_skipped_except_projects(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             home = Path(tmp) / "hermes"
             projects = home / "projects"
             projects.mkdir(parents=True)
@@ -93,7 +98,7 @@ class SkipRules(unittest.TestCase):
 
     def test_plugin_install_tree_is_never_synced(self):
         """A catalog install is a pinned git checkout, not the user's work."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             home = Path(tmp) / "hermes"
             (home / "plugins" / "git-hook").mkdir(parents=True)
             os.environ["HERMES_HOME"] = str(home)
@@ -123,7 +128,7 @@ class PushKnob(unittest.TestCase):
 class GitSync(unittest.TestCase):
     def setUp(self):
         sync.reset_state()
-        self.td = tempfile.TemporaryDirectory()
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.td.name)
         os.environ["PROJECTS_ROOT"] = str(self.root)
         os.environ.pop("GIT_HOOK_COMMIT", None)
@@ -145,6 +150,10 @@ class GitSync(unittest.TestCase):
         _git(["clone", str(bare), str(work)], cwd=self.root)
         _git(["config", "user.name", "dev"], cwd=work)
         _git(["config", "user.email", "dev@example.com"], cwd=work)
+        # A clone takes the global config, so disable background maintenance here
+        # too: it writes into .git after the test's last git command.
+        _git(["config", "gc.auto", "0"], cwd=work)
+        _git(["config", "maintenance.auto", "false"], cwd=work)
         return bare, work
 
     def test_pull_ff_only_when_clean(self):
@@ -310,7 +319,7 @@ class TransientPaths(unittest.TestCase):
 
     def setUp(self):
         sync.reset_state()
-        self.td = tempfile.TemporaryDirectory()
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = _init_repo(Path(self.td.name) / "repo")
         os.environ["PROJECTS_ROOT"] = str(self.td.name)
         os.environ["GIT_HOOK_PUSH"] = "0"
@@ -375,7 +384,7 @@ class ScopeAndSecrets(unittest.TestCase):
 
     def setUp(self):
         sync.reset_state()
-        self.td = tempfile.TemporaryDirectory()
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.base = Path(self.td.name)
         self.saved = {k: os.environ.get(k) for k in
                       ("HERMES_HOME", "PROJECTS_ROOT", "GIT_HOOK_ROOTS", "GIT_HOOK_PUSH")}
@@ -442,7 +451,7 @@ class SessionScopedState(unittest.TestCase):
 
     def setUp(self):
         sync.reset_state()
-        self.td = tempfile.TemporaryDirectory()
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.td.name)
         os.environ["PROJECTS_ROOT"] = str(self.root)
         os.environ["GIT_HOOK_PUSH"] = "0"
@@ -496,7 +505,7 @@ class PullBudget(unittest.TestCase):
 
     def setUp(self):
         sync.reset_state()
-        self.td = tempfile.TemporaryDirectory()
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.td.name)
         origin = _init_repo(self.root / "origin")
         bare = self.root / "origin.git"
@@ -527,7 +536,7 @@ class WorktreeLock(unittest.TestCase):
 
     def setUp(self):
         sync.reset_state()
-        self.td = tempfile.TemporaryDirectory()
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.repo = _init_repo(Path(self.td.name) / "repo")
         self.wt = Path(self.td.name) / "wt"
         _git(["worktree", "add", "-b", "side", str(self.wt)], cwd=self.repo)
