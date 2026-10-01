@@ -3,16 +3,22 @@
 A Hermes Agent plugin (hooks only, no tools) that keeps the git worktrees the
 agent works in honest:
 
-- **Before a read**: `git fetch` and, when the worktree is clean,
-  `git pull --ff-only`, so the agent reads current code instead of a stale
-  checkout.
+- **Before a read**: at most one `git pull --ff-only` per worktree per session
+  (a pull fetches as part of the pull), and only when the worktree is clean and
+  has an upstream. Nothing runs on a dirty worktree, so the agent reads current
+  code instead of a stale checkout.
 - **After the turn**: commit **only the files this turn changed** and push.
   It does not sweep up unrelated dirty files, and it does not commit the
   agent's own secrets, state, caches or logs.
 
-Failure is never silent: a busy index, a hook rejection, a failed or timed-out
-push is reported back into the session as tool-call context, and the paths stay
-queued for a retry.
+Failure is not silent, and it is not published a second way: a busy index, a
+hook rejection, a failed or timed-out push is written to the log, the paths stay
+queued for a retry, and the plugin also returns a note from its turn-end and
+session-end hooks. Hermes currently discards hook return values, so the log is
+where those notes actually surface.
+
+State is per session: two sessions in one repository never share a batch, so one
+session's flush cannot publish the other session's half-finished edit.
 
 ## Install
 
@@ -36,6 +42,7 @@ Every knob is an environment variable, read per call — no config.yaml schema.
 | `GIT_HOOK_COMMIT_MSG` | `update <name>` | Overrides the commit subject. |
 | `GIT_HOOK_COMMIT_PATH` | – | Extra `PATH` entries (colon-separated) for git subprocesses, e.g. a credential helper. |
 | `GIT_HOOK_PULL_TIMEOUT_S` | `12` | Per-worktree pull timeout. |
+| `GIT_HOOK_HOOK_BUDGET_S` | `20` | Total budget for one `pre_tool_call` callback across every root it touches. The host allows 30 s before it fails the hook closed and blocks the tool call, so this stays under it. A root that would overrun is skipped and retried on the next call. |
 | `GIT_HOOK_PUSH_TIMEOUT_S` | `20` | Per-worktree push timeout. |
 | `PROJECTS_ROOT` | `$HERMES_HOME/projects` | Treated as the agent's own workspace: never skipped by the secret rules. |
 | `HERMES_HOME` | `$HOME/.hermes` | Root of the agent's state; `$HERMES_HOME/plugins` is never synced. |

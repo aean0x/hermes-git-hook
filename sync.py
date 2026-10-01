@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
@@ -74,18 +75,34 @@ _FALSE = frozenset({"0", "false", "no", "off", ""})
 _TRANSIENT_MARKER = ".hermes-tmp"
 
 _lock = threading.Lock()
-_pulled: Set[str] = set()
-# Per-root snapshot of the dirty set: rel path -> content signature (status,
-# size, mtime_ns). Value-carrying, not path-only — see _porcelain_snapshot.
-_before: Dict[str, "Dict[str, PathSig]"] = {}
-_dirty: Dict[str, Set[str]] = {}
-_unpushed: Set[str] = set()
+# Every state map below is keyed by (session_id, root). The gateway runs
+# several sessions in one process, and a shared batch would let one session's
+# flush publish the other session's half-finished edit under its own commit.
+SessionKey = Tuple[str, str]
+_pulled: Set[SessionKey] = set()
+# Per-(session, root) snapshot of the dirty set: rel path -> content signature
+# (status, size, mtime_ns). Value-carrying, not path-only — see
+# _porcelain_snapshot.
+_before: Dict[SessionKey, "Dict[str, PathSig]"] = {}
+_dirty: Dict[SessionKey, Set[str]] = {}
+_unpushed: Set[SessionKey] = set()
 _root_cache: Dict[str, Optional[str]] = {}
 
 # Flush outcomes that must put paths back on _dirty (commit never landed).
 _RETRY_DIRTY = frozenset(
     {"busy", "locked", "timeout", "add-failed", "commit-skipped"}
 )
+
+# Never prompt. A credential or ssh passphrase question inside a hook would
+# block until the timeout, and pre_tool_call fails the user's tool call closed.
+_NO_PROMPT_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_SSH_COMMAND": "ssh -oBatchMode=yes",
+}
+
+# Total budget for one pre_tool_call callback, across every root it touches.
+# The host allows 30 s before it blocks the tool call, so stay well under it.
+_HOOK_BUDGET_S = 20.0
 
 
 def _truthy(name: str, default: bool = True) -> bool:
@@ -421,13 +438,31 @@ def _has_upstream(root: str) -> bool:
     return proc.returncode == 0 and bool((proc.stdout or "").strip())
 
 
+def _worktree_git_dir(root: str) -> Path:
+    """The per-worktree git dir, which is never inside the worktree itself.
+
+    In a linked worktree `.git` is a *file* holding ``gitdir: <path>``, and the
+    path it points at lives under the main repo's ``.git/worktrees/<name>``.
+    The lock belongs there: a lock written into the worktree shows up as an
+    untracked change on the next `git status`.
+    """
+    dot = Path(root) / ".git"
+    if not dot.is_file():
+        return dot
+    try:
+        text = dot.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return dot
+    if not text.startswith("gitdir:"):
+        return dot
+    target = Path(text.split(":", 1)[1].strip())
+    if not target.is_absolute():
+        target = (dot.parent / target).resolve()
+    return target
+
+
 def _with_repo_lock(root: str):
-    git_dir = Path(root) / ".git"
-    if git_dir.is_file():
-        # linked worktree: lock next to the worktree, not the shared git dir
-        lock_path = Path(root) / ".git-auto-sync.lock"
-    else:
-        lock_path = git_dir / "git-hook.lock"
+    lock_path = _worktree_git_dir(root) / "git-hook.lock"
 
     class _Guard:
         def __enter__(self):
@@ -448,29 +483,47 @@ def _with_repo_lock(root: str):
     return _Guard()
 
 
-def pull_if_clean(root: str) -> str:
-    """ff-only pull. Returns a short status token. Never raises."""
-    if root in _pulled:
+def pull_if_clean(
+    root: str, session_id: str = "", deadline: Optional[float] = None
+) -> str:
+    """ff-only pull. Returns a short status token. Never raises.
+
+    *deadline* is a ``time.monotonic()`` instant: it caps the subprocess so one
+    callback cannot run past the host's hook budget and fail the user's tool
+    call closed.
+    """
+    key = (session_id, root)
+    if key in _pulled:
         return "already"
     if _busy(root):
         return "busy"
     if _porcelain_paths(root):
         return "dirty"
     if not _has_upstream(root):
-        _pulled.add(root)
+        _pulled.add(key)
         return "no-upstream"
     timeout = _timeout("GIT_HOOK_PULL_TIMEOUT_S", 12)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "budget"
+        timeout = min(timeout, remaining)
     try:
         with _with_repo_lock(root):
             if _porcelain_paths(root):
                 return "dirty"
-            proc = _git(["pull", "--ff-only", "--quiet"], cwd=root, timeout=timeout)
+            proc = _git(
+                ["pull", "--ff-only", "--quiet"],
+                cwd=root,
+                timeout=timeout,
+                extra_env=_NO_PROMPT_ENV,
+            )
     except OSError:
         return "locked"
     except subprocess.TimeoutExpired:
         log.warning("git-hook: pull timeout %s", root)
         return "timeout"
-    _pulled.add(root)
+    _pulled.add(key)
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()[:300]
         log.info("git-hook: pull skipped %s (%s)", root, err)
@@ -496,9 +549,14 @@ def _push(root: str, source: str, sha: str) -> str:
     timeout = _timeout("GIT_HOOK_PUSH_TIMEOUT_S", 20)
     try:
         if not _has_upstream(root):
-            push = _git(["push", "origin", "HEAD"], cwd=root, timeout=timeout)
+            push = _git(
+                ["push", "origin", "HEAD"],
+                cwd=root,
+                timeout=timeout,
+                extra_env=_NO_PROMPT_ENV,
+            )
         else:
-            push = _git(["push"], cwd=root, timeout=timeout)
+            push = _git(["push"], cwd=root, timeout=timeout, extra_env=_NO_PROMPT_ENV)
     except subprocess.TimeoutExpired:
         log.warning("git-hook [%s]: committed %s, push timeout", source, sha)
         return f"committed_local_only {sha}"
@@ -596,7 +654,7 @@ def commit_and_push(root: str, paths: Set[str], source: str) -> str:
                 ],
                 cwd=root,
                 timeout=15,
-                extra_env={"GIT_TERMINAL_PROMPT": "0"},
+                extra_env=dict(_NO_PROMPT_ENV),
             )
             if commit.returncode != 0:
                 err = (commit.stderr or commit.stdout or "").strip()[:300]
@@ -625,6 +683,7 @@ def _roots_for(tool_name: str, args: Optional[Dict[str, Any]]) -> list[str]:
 def on_pre_tool_call(
     tool_name: str = "",
     args: Optional[Dict[str, Any]] = None,
+    session_id: str = "",
     **_kwargs: Any,
 ) -> None:
     if disabled():
@@ -632,7 +691,11 @@ def on_pre_tool_call(
     # Writes still record a before-snapshot; pull only on non-write.
     do_pull = tool_name not in _WRITE_TOOLS
     roots = _roots_for(tool_name, args)
+    # One budget for the whole callback: the host fails pre_tool_call closed
+    # when it overruns, which would block the user's tool call.
+    deadline = time.monotonic() + _timeout("GIT_HOOK_HOOK_BUDGET_S", _HOOK_BUDGET_S)
     for root in roots:
+        key = (session_id, root)
         # Snapshot + optional pull run OUTSIDE the module lock. The lock only
         # guards dict state; holding it across git subprocesses (porcelain up
         # to 5s, pull up to GIT_HOOK_PULL_TIMEOUT_S) made one session's slow
@@ -640,24 +703,25 @@ def on_pre_tool_call(
         # the plugin manager then saw the callback still running at the next
         # tool completion and skipped it ("previous timeout or still running").
         with _lock:
-            missing = root not in _before
+            missing = key not in _before
         if missing:
             snap = _porcelain_snapshot(root)
             with _lock:
-                if root not in _before:
-                    _before[root] = snap
+                if key not in _before:
+                    _before[key] = snap
         if do_pull:
-            status = pull_if_clean(root)
+            status = pull_if_clean(root, session_id, deadline)
             if status == "pulled":
                 snap = _porcelain_snapshot(root)
                 with _lock:
-                    _before[root] = snap
+                    _before[key] = snap
 
 
 def on_post_tool_call(
     tool_name: str = "",
     args: Optional[Dict[str, Any]] = None,
     status: str = "",
+    session_id: str = "",
     **_kwargs: Any,
 ) -> None:
     if disabled():
@@ -676,7 +740,8 @@ def on_post_tool_call(
         snapshots[root] = _porcelain_snapshot(root)
     with _lock:
         for root in roots:
-            before = _before.get(root) or {}
+            key = (session_id, root)
+            before = _before.get(key) or {}
             after = snapshots[root]
             # A path is this turn's delta when it is new OR when its content
             # signature moved. The second half is what makes an edit to an
@@ -684,8 +749,8 @@ def on_post_tool_call(
             # keeps an identical signature and is still left alone.
             delta = {rel for rel, sig in after.items() if before.get(rel) != sig}
             if delta:
-                _dirty.setdefault(root, set()).update(delta)
-            _before[root] = after
+                _dirty.setdefault(key, set()).update(delta)
+            _before[key] = after
 
 
 def _note(root: str, status: str) -> Optional[str]:
@@ -701,15 +766,24 @@ def _note(root: str, status: str) -> Optional[str]:
     return None
 
 
-def _flush(source: str) -> Optional[str]:
+def _flush(source: str, session_id: str = "") -> Optional[str]:
+    """Commit and push this session's queued paths only.
+
+    Another session's batch in the same repo is left alone: it belongs to a
+    turn that has not finished, and publishing it here would attribute its
+    half-finished edit to this commit.
+    """
     if disabled():
         return None
     with _lock:
-        pending = {root: set(paths) for root, paths in _dirty.items() if paths}
-        unpushed = set(_unpushed)
-        _dirty.clear()
+        mine = [k for k in _dirty if k[0] == session_id]
+        pending = {k: set(_dirty[k]) for k in mine if _dirty[k]}
+        unpushed = {k for k in _unpushed if k[0] == session_id}
+        for k in mine:
+            _dirty.pop(k, None)
     notes: list[str] = []
-    for root, paths in pending.items():
+    for key, paths in pending.items():
+        root = key[1]
         try:
             status = commit_and_push(root, paths, source)
         except Exception:
@@ -720,14 +794,15 @@ def _flush(source: str) -> Optional[str]:
             notes.append(note)
         with _lock:
             if status in _RETRY_DIRTY:
-                _dirty.setdefault(root, set()).update(paths)
+                _dirty.setdefault(key, set()).update(paths)
             if status.startswith("committed_local_only"):
-                _unpushed.add(root)
+                _unpushed.add(key)
             elif status.startswith("pushed") or status.startswith("committed "):
-                _unpushed.discard(root)
-    for root in unpushed:
-        if root in pending:
+                _unpushed.discard(key)
+    for key in unpushed:
+        if key in pending:
             continue
+        root = key[1]
         try:
             sha = (
                 _git(["rev-parse", "--short", "HEAD"], cwd=root, timeout=3).stdout or ""
@@ -741,26 +816,28 @@ def _flush(source: str) -> Optional[str]:
             notes.append(note)
         with _lock:
             if status.startswith("pushed"):
-                _unpushed.discard(root)
+                _unpushed.discard(key)
     if not notes:
         return None
     return "git-hook:\n" + "\n".join(f"- {n}" for n in notes)
 
 
-def on_post_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
+def on_post_llm_call(
+    session_id: str = "", **kwargs: Any
+) -> Optional[Dict[str, str]]:
     if kwargs.get("error"):
         return None
-    body = _flush("post_llm_call")
+    body = _flush("post_llm_call", session_id)
     if body:
         return {"context": body}
     return None
 
 
-def on_session_end(**kwargs: Any) -> Optional[Dict[str, str]]:
+def on_session_end(session_id: str = "", **kwargs: Any) -> Optional[Dict[str, str]]:
     reason = str(kwargs.get("turn_exit_reason") or "")
     if reason == "error" and kwargs.get("error"):
         return None
-    body = _flush(f"on_session_end:{reason or 'unknown'}")
+    body = _flush(f"on_session_end:{reason or 'unknown'}", session_id)
     if body:
         return {"context": body}
     return None
