@@ -360,6 +360,73 @@ class TransientPaths(unittest.TestCase):
         self.assertNotIn("transient-scratch.txt", log)
 
 
+class ScopeAndSecrets(unittest.TestCase):
+    """Only opted-in repos are synced, and secrets are filtered per staged file."""
+
+    def setUp(self):
+        sync.reset_state()
+        self.td = tempfile.TemporaryDirectory()
+        self.base = Path(self.td.name)
+        self.saved = {k: os.environ.get(k) for k in
+                      ("HERMES_HOME", "PROJECTS_ROOT", "GIT_HOOK_ROOTS", "GIT_HOOK_PUSH")}
+        for k in self.saved:
+            os.environ.pop(k, None)
+        os.environ["GIT_HOOK_PUSH"] = "0"
+
+    def tearDown(self):
+        sync.reset_state()
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.td.cleanup()
+
+    def test_hermes_home_repo_flush_never_stages_secrets_or_unrelated_untracked(self):
+        home = _init_repo(self.base / "hermes")
+        os.environ["HERMES_HOME"] = str(home)
+        os.environ["GIT_HOOK_ROOTS"] = str(home)  # explicit opt-in
+        (home / "notes").mkdir()
+        (home / "notes" / "old.txt").write_text("unrelated untracked\n")
+        soul = home / "SOUL.md"
+
+        sync.on_pre_tool_call("write_file", {"path": str(soul)})
+        soul.write_text("me\n")
+        (home / "notes" / "new.md").write_text("ours\n")
+        (home / ".env").write_text("K=v\n")
+        (home / "auth.json").write_text("{}\n")
+        (home / "profiles" / "work").mkdir(parents=True)
+        (home / "profiles" / "work" / ".env").write_text("K=v\n")
+        (home / "id_ed25519").write_text("key\n")
+        sync.on_post_tool_call("write_file", {"path": str(soul)}, status="ok")
+        sync._flush("test")
+
+        committed = set(
+            _git(["show", "--name-only", "--pretty=format:"], cwd=home).stdout.split()
+        )
+        self.assertEqual(committed, {"SOUL.md", "notes/new.md"})
+
+    def test_repo_outside_opt_in_roots_is_ignored_and_fsmonitor_never_runs(self):
+        # Both repos sit under PROJECTS_ROOT (exempt from the skip rules), so
+        # only the GIT_HOOK_ROOTS allowlist can keep the second one out.
+        os.environ["PROJECTS_ROOT"] = str(self.base / "projects")
+        os.environ["GIT_HOOK_ROOTS"] = str(self.base / "projects" / "repo")
+        outside = _init_repo(self.base / "projects" / "not-opted-in")
+        self.assertIsNone(sync.git_root(str(outside / "README")))
+
+        inside = _init_repo(self.base / "projects" / "repo")
+        marker = self.base / "fsmonitor-ran"
+        hook = self.base / "fsmonitor.sh"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+        hook.chmod(0o755)
+        _git(["config", "core.fsmonitor", str(hook)], cwd=inside)
+        (inside / "README").write_text("dirty\n")
+        self.assertEqual(sync.git_root(str(inside / "README")), str(inside.resolve()))
+        sync.on_pre_tool_call("read_file", {"path": str(inside / "README")})
+        self.assertIn("README", sync._before[str(inside.resolve())])
+        self.assertFalse(marker.exists(), "repo-config fsmonitor command was executed")
+
+
 if __name__ == "__main__":
     if not shutil.which("git"):
         raise SystemExit("git required")

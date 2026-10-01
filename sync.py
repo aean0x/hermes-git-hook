@@ -50,6 +50,17 @@ _SENSITIVE_DIRS = frozenset(
     }
 )
 _SENSITIVE_FILE_PREFIXES = ("auth.json", "config.yaml", ".env")
+# Secret-looking file names that are never auto-staged in ANY repo.
+_SECRET_NAME_PREFIXES = (
+    ".env",
+    "auth.json",
+    "credentials",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+)
+_SECRET_NAME_SUFFIXES = (".pem", ".key")
 _PATCH_FILE_RE = re.compile(
     r"^\*\*\* (?:(?:Update|Add|Delete) File|Rename File(?: From)?): (.+)$"
 )
@@ -102,6 +113,25 @@ def _projects_root() -> Path:
     return (_home() / "projects").resolve()
 
 
+def _allowed_roots() -> list[Path]:
+    """Directories whose worktrees git-hook may touch (opt-in per repo).
+
+    `GIT_HOOK_ROOTS` is a colon-separated allowlist; `*` restores "every
+    worktree". Unset, only repos under `PROJECTS_ROOT` are synced.
+    """
+    raw = os.environ.get("GIT_HOOK_ROOTS", "").strip()
+    if raw == "*":
+        return [Path("/")]
+    if not raw:
+        return [_projects_root()]
+    return [Path(p).expanduser().resolve() for p in raw.split(":") if p.strip()]
+
+
+def _allowed(path: str) -> bool:
+    p = Path(path).resolve()
+    return any(p == r or r in p.parents for r in _allowed_roots())
+
+
 def _timeout(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
@@ -142,8 +172,10 @@ def _git(
     env["PATH"] = ":".join(bits + ([cur] if cur else []))
     if extra_env:
         env.update(extra_env)
+    # core.fsmonitor in a repo's own config is a command git runs on status /
+    # add / commit. The repo is picked by the model, so never run it.
     return subprocess.run(
-        [_git_bin(), *args],
+        [_git_bin(), "-c", "core.fsmonitor=", *args],
         cwd=cwd,
         timeout=timeout,
         stdout=subprocess.PIPE,
@@ -222,12 +254,26 @@ def _sensitive(path: Path, home: Path) -> bool:
     # A sensitive directory anywhere on the path (e.g. home/secrets/api.key).
     if any(p in _SENSITIVE_DIRS for p in parts):
         return True
-    # The agent's own secret files live directly under home.
-    if len(parts) == 1:
-        name = parts[0]
+    # The agent's own secret files live directly under home (or a profile).
+    if len(parts) == 1 or (len(parts) == 3 and parts[0] == "profiles"):
+        name = parts[-1]
         if name.startswith(_SENSITIVE_FILE_PREFIXES) or ".db" in name:
             return True
     return False
+
+
+def _secret_file(root: str, rel: str) -> bool:
+    """Per-file secret filter, applied to every path before `git add`."""
+    name = rel.rsplit("/", 1)[-1].lower()
+    if name.startswith(_SECRET_NAME_PREFIXES) or name.endswith(_SECRET_NAME_SUFFIXES):
+        return True
+    p = Path(root, rel)
+    projects = _projects_root()
+    if p == projects or projects in p.parents:
+        return False
+    home = _home()
+    return (p == home or home in p.parents) and _sensitive(p, home)
+
 
 def _skipped(path: str) -> bool:
     try:
@@ -257,7 +303,7 @@ def git_root(path: str) -> Optional[str]:
     key = str(start)
     if key in _root_cache:
         return _root_cache[key]
-    if _skipped(key):
+    if _skipped(key) or not _allowed(key):
         _root_cache[key] = None
         return None
     try:
@@ -276,7 +322,7 @@ def git_root(path: str) -> Optional[str]:
     if not root:
         _root_cache[key] = None
         return None
-    if _skipped(root):
+    if _skipped(root) or not _allowed(root):
         _root_cache[key] = None
         return None
     _root_cache[key] = root
@@ -308,7 +354,9 @@ def _path_sig(root: str, rel: str, status: str) -> PathSig:
 def _porcelain_snapshot(root: str) -> Dict[str, PathSig]:
     """Dirty paths of `root` mapped to their content signature."""
     try:
-        proc = _git(["status", "--porcelain", "-z"], cwd=root, timeout=5)
+        # -uall: list untracked files one by one. A collapsed `?? dir/` entry
+        # would make `git add -- dir/` stage everything in it.
+        proc = _git(["status", "--porcelain", "-z", "-uall"], cwd=root, timeout=5)
     except (subprocess.TimeoutExpired, OSError):
         return {}
     if proc.returncode != 0 or not proc.stdout:
@@ -513,6 +561,10 @@ def commit_and_push(root: str, paths: Set[str], source: str) -> str:
         log.warning("git-hook: busy %s (merge/rebase in progress); will retry", root)
         return "busy"
     rels = sorted({p for p in paths if p and not p.startswith("/")})
+    secret = [r for r in rels if _secret_file(root, r)]
+    if secret:
+        log.info("git-hook: %s not staging %d secret-looking path(s)", root, len(secret))
+        rels = [r for r in rels if r not in secret]
     # Never hand git a path that no longer resolves: one dead pathspec fails the
     # entire add batch (git exits non-zero and stages nothing).
     rels = _stageable(root, rels)

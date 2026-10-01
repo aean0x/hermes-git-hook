@@ -30,8 +30,9 @@ Every knob is an environment variable, read per call — no config.yaml schema.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `GIT_HOOK_ROOTS` | `$PROJECTS_ROOT` | Colon-separated allowlist of directories whose worktrees are synced (opt-in per repo). A repo outside every entry is never pulled, committed or pushed. `*` means every worktree. |
 | `GIT_HOOK_COMMIT` | `1` (on) | `0` disables all commits and pushes. Reads still pull. |
-| `GIT_HOOK_PUSH` | `1` (on) | `0` keeps commits local. Set it when you do not want an agent turn to push. |
+| `GIT_HOOK_PUSH` | `1` (on) | **Push is on** for every allowlisted repo. `0` keeps commits local. |
 | `GIT_HOOK_COMMIT_MSG` | `update <name>` | Overrides the commit subject. |
 | `GIT_HOOK_COMMIT_PATH` | – | Extra `PATH` entries (colon-separated) for git subprocesses, e.g. a credential helper. |
 | `GIT_HOOK_PULL_TIMEOUT_S` | `12` | Per-worktree pull timeout. |
@@ -43,12 +44,20 @@ Falsy values are `0`, `false`, `no`, `off` and the empty string.
 
 ## What it will never do
 
+- Touch a repo outside `GIT_HOOK_ROOTS` (default: only `PROJECTS_ROOT`).
+- Run a repo's `core.fsmonitor` command: every git call passes
+  `-c core.fsmonitor=`.
+- Stage a secret-looking file in any repo: `.env*`, `auth.json`,
+  `credentials*`, `id_rsa*`/`id_dsa*`/`id_ecdsa*`/`id_ed25519*`, `*.pem`,
+  `*.key`. The filter runs on every path before `git add`, and untracked
+  directories are listed file by file (`-uall`), so a collapsed `dir/` entry is
+  never staged whole.
 - Touch anything under `/nix`, `/proc`, `/sys`, `/dev`, `/run`, `/tmp`,
   `/var/tmp`.
 - Stage the agent's own state: `credentials`, `secrets`, `mcp-tokens`,
   `sessions`, `memories`, `state`, `hmc_state`, `logs`, `cache`,
-  `cost-snapshots`, or `auth.json`, `config.yaml`, `.env`, `*.db` under
-  `$HERMES_HOME`.
+  `cost-snapshots`, or `auth.json`, `config.yaml`, `.env`, `*.db` directly
+  under `$HERMES_HOME` or `$HERMES_HOME/profiles/<name>/`.
 - Sync the plugin install tree (`$HERMES_HOME/plugins/**`). A catalog install
   is a single-commit checkout pinned to the SHA that was reviewed; this plugin
   will not pull or commit it away from that commit.
