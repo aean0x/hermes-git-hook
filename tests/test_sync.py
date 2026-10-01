@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -26,6 +27,15 @@ def _git(args, cwd, check=True):
 def _stamp(path: Path, ns: int) -> None:
     """Pin mtime (ns) so signature tests do not depend on fs timestamp resolution."""
     os.utime(path, ns=(ns, ns))
+
+
+def _key(root) -> tuple:
+    """State key for a hook call that passes no session_id (the tests' default).
+
+    Every state map is keyed by (session_id, root) so two sessions in one repo
+    cannot share a batch.
+    """
+    return ("", str(root))
 
 
 def _init_repo(path: Path, *, name="dev", email="dev@example.com") -> Path:
@@ -169,7 +179,7 @@ class GitSync(unittest.TestCase):
         sync.on_post_tool_call("write_file", {"path": str(target)}, status="ok")
 
         result = sync.commit_and_push(
-            str(work), set(sync._dirty.get(str(work), set())), "test"
+            str(work), set(sync._dirty.get(_key(work), set())), "test"
         )
         self.assertIn("committed", result)
         log = _git(["log", "-1", "--name-only", "--pretty=format:"], cwd=work).stdout
@@ -198,9 +208,9 @@ class GitSync(unittest.TestCase):
         _stamp(target, 1_700_000_000_000_000_000)
         sync.on_post_tool_call("patch", {"path": str(target)}, status="ok")
 
-        self.assertEqual(sync._dirty.get(str(work)), {"README"})
+        self.assertEqual(sync._dirty.get(_key(work)), {"README"})
         result = sync.commit_and_push(
-            str(work), set(sync._dirty.get(str(work), set())), "test"
+            str(work), set(sync._dirty.get(_key(work), set())), "test"
         )
         self.assertIn("committed", result)
         log = _git(["log", "-1", "--name-only", "--pretty=format:"], cwd=work).stdout
@@ -260,7 +270,7 @@ class GitSync(unittest.TestCase):
         result = sync.on_post_llm_call()
         self.assertIsNotNone(result)
         self.assertIn("busy", result["context"])
-        self.assertTrue(sync._dirty.get(str(work)))
+        self.assertTrue(sync._dirty.get(_key(work)))
 
     def test_commit_skip_is_warning_status(self):
         _, work = self._clone_pair()
@@ -287,11 +297,11 @@ class GitSync(unittest.TestCase):
         result = sync.on_post_llm_call()
         self.assertIsNotNone(result)
         self.assertIn("push failed", result["context"])
-        self.assertIn(str(work), sync._unpushed)
+        self.assertIn(_key(work), sync._unpushed)
         again = sync.on_post_llm_call()
         self.assertIsNotNone(again)
         self.assertIn("push failed", again["context"])
-        self.assertIn(str(work), sync._unpushed)
+        self.assertIn(_key(work), sync._unpushed)
 
 
 class TransientPaths(unittest.TestCase):
@@ -338,7 +348,7 @@ class TransientPaths(unittest.TestCase):
         temp.write_text("scratch\n")
         sync.on_post_tool_call("write_file", {"path": str(target)}, status="ok")
         temp.unlink()  # renamed over the target before the flush
-        self.assertEqual(sync._dirty.get(str(self.root)), {"README"})
+        self.assertEqual(sync._dirty.get(_key(self.root)), {"README"})
 
     def test_deleted_tracked_path_is_still_staged(self):
         (self.root / "README").unlink()
@@ -423,8 +433,120 @@ class ScopeAndSecrets(unittest.TestCase):
         (inside / "README").write_text("dirty\n")
         self.assertEqual(sync.git_root(str(inside / "README")), str(inside.resolve()))
         sync.on_pre_tool_call("read_file", {"path": str(inside / "README")})
-        self.assertIn("README", sync._before[str(inside.resolve())])
+        self.assertIn("README", sync._before[_key(inside.resolve())])
         self.assertFalse(marker.exists(), "repo-config fsmonitor command was executed")
+
+
+class SessionScopedState(unittest.TestCase):
+    """The gateway runs several sessions in one process: never share a batch."""
+
+    def setUp(self):
+        sync.reset_state()
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        os.environ["PROJECTS_ROOT"] = str(self.root)
+        os.environ["GIT_HOOK_PUSH"] = "0"
+        origin = _init_repo(self.root / "origin")
+        self.work = self.root / "work"
+        _git(["clone", str(origin), str(self.work)], cwd=self.root)
+        _git(["config", "user.name", "dev"], cwd=self.work)
+        _git(["config", "user.email", "dev@example.com"], cwd=self.work)
+
+    def tearDown(self):
+        sync.reset_state()
+        os.environ.pop("PROJECTS_ROOT", None)
+        os.environ.pop("GIT_HOOK_PUSH", None)
+        self.td.cleanup()
+
+    def _turn(self, session: str, name: str) -> None:
+        target = self.work / name
+        sync.on_pre_tool_call("write_file", {"path": str(target)}, session_id=session)
+        target.write_text(f"from {session}\n")
+        sync.on_post_tool_call(
+            "write_file", {"path": str(target)}, status="ok", session_id=session
+        )
+
+    def _committed(self) -> str:
+        return _git(
+            ["show", "--name-only", "--pretty=format:"], cwd=self.work
+        ).stdout
+
+    def test_one_session_flush_leaves_the_other_batch_alone(self):
+        self._turn("sess-a", "a.txt")
+        self._turn("sess-b", "b.txt")
+
+        sync._flush("post_llm_call", "sess-a")
+        committed = self._committed()
+        self.assertIn("a.txt", committed)
+        self.assertNotIn("b.txt", committed)
+        self.assertIn("b.txt", sync._dirty[("sess-b", str(self.work))])
+
+        sync._flush("post_llm_call", "sess-b")
+        self.assertIn("b.txt", self._committed())
+
+    def test_pull_is_once_per_session_not_once_per_process(self):
+        _git(["remote", "set-url", "origin", str(self.root / "origin")], cwd=self.work)
+        self.assertEqual(sync.pull_if_clean(str(self.work), "sess-a"), "pulled")
+        self.assertEqual(sync.pull_if_clean(str(self.work), "sess-a"), "already")
+        self.assertEqual(sync.pull_if_clean(str(self.work), "sess-b"), "pulled")
+
+
+class PullBudget(unittest.TestCase):
+    """A pre_tool_call callback must not run past the host's hook budget."""
+
+    def setUp(self):
+        sync.reset_state()
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        origin = _init_repo(self.root / "origin")
+        bare = self.root / "origin.git"
+        _git(["clone", "--bare", str(origin), str(bare)], cwd=self.root)
+        self.work = self.root / "work"
+        _git(["clone", str(bare), str(self.work)], cwd=self.root)
+
+    def tearDown(self):
+        sync.reset_state()
+        self.td.cleanup()
+
+    def test_expired_budget_skips_the_pull_and_stays_retryable(self):
+        status = sync.pull_if_clean(
+            str(self.work), "sess", deadline=time.monotonic() - 1
+        )
+        self.assertEqual(status, "budget")
+        self.assertEqual(sync._pulled, set(), "a skipped pull must not count as done")
+
+    def test_budget_shortens_rather_than_lengthens_the_pull(self):
+        status = sync.pull_if_clean(
+            str(self.work), "sess", deadline=time.monotonic() + 60
+        )
+        self.assertEqual(status, "pulled")
+
+
+class WorktreeLock(unittest.TestCase):
+    """The lock must not land in the worktree, where it reads as untracked dirt."""
+
+    def setUp(self):
+        sync.reset_state()
+        self.td = tempfile.TemporaryDirectory()
+        self.repo = _init_repo(Path(self.td.name) / "repo")
+        self.wt = Path(self.td.name) / "wt"
+        _git(["worktree", "add", "-b", "side", str(self.wt)], cwd=self.repo)
+
+    def tearDown(self):
+        sync.reset_state()
+        self.td.cleanup()
+
+    def test_plain_repo_keeps_the_lock_in_dot_git(self):
+        self.assertEqual(sync._worktree_git_dir(str(self.repo)), self.repo / ".git")
+
+    def test_linked_worktree_lock_lives_in_its_per_worktree_git_dir(self):
+        git_dir = sync._worktree_git_dir(str(self.wt))
+        self.assertIn("worktrees", str(git_dir))
+        with sync._with_repo_lock(str(self.wt)):
+            self.assertTrue((git_dir / "git-hook.lock").exists())
+            self.assertFalse((self.wt / ".git-auto-sync.lock").exists())
+        status = _git(["status", "--porcelain"], cwd=self.wt).stdout
+        self.assertNotIn("lock", status)
 
 
 if __name__ == "__main__":
