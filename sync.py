@@ -413,11 +413,17 @@ def _busy(root: str) -> bool:
     git_dir = Path(root) / ".git"
     if git_dir.is_file():
         return False
+    # A rebase is in progress only while git's own state directory is there:
+    # `rebase-merge/` (merge backend) or `rebase-apply/` (am backend) — the same
+    # pair `git status` reads. A bare `REBASE_HEAD` is not that: git 2.55 leaves
+    # it behind after `rebase --continue` finishes, the tree is clean, and both
+    # `rebase --abort` and `rebase --quit` answer "no rebase in progress", so
+    # nothing ever removes it. Reading it as "busy" latched the worktree busy
+    # forever and every later sync for it was skipped.
+    if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+        return True
     for name in (
         "MERGE_HEAD",
-        "REBASE_HEAD",
-        "rebase-merge",
-        "rebase-apply",
         "CHERRY_PICK_HEAD",
         "REVERT_HEAD",
     ):

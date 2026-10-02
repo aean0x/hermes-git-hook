@@ -313,6 +313,51 @@ class GitSync(unittest.TestCase):
         self.assertIn(_key(work), sync._unpushed)
 
 
+class BusyDetection(unittest.TestCase):
+    """`_busy()` must read the same state `git status` reads.
+
+    git 2.55 leaves a bare `.git/REBASE_HEAD` behind after `rebase --continue`
+    finishes, with a clean tree, and neither `rebase --abort` nor `rebase --quit`
+    removes it. Treating that leftover as "rebase in progress" latched the
+    worktree busy forever, so the hook skipped the whole fetch/commit path for
+    it on every later turn.
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.repo = _init_repo(Path(self.td.name) / "repo")
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _git_dir(self) -> Path:
+        return self.repo / ".git"
+
+    def test_bare_rebase_head_is_not_busy(self):
+        (self._git_dir() / "REBASE_HEAD").write_text("92ba3a9deadbeef\n")
+        self.assertEqual(_git(["status", "--porcelain"], cwd=self.repo).stdout, "")
+        self.assertFalse(sync._busy(str(self.repo)))
+
+    def test_rebase_merge_dir_is_busy(self):
+        (self._git_dir() / "REBASE_HEAD").write_text("deadbeef\n")
+        (self._git_dir() / "rebase-merge").mkdir()
+        self.assertTrue(sync._busy(str(self.repo)))
+
+    def test_rebase_apply_dir_is_busy(self):
+        (self._git_dir() / "rebase-apply").mkdir()
+        self.assertTrue(sync._busy(str(self.repo)))
+
+    def test_merge_and_sequencer_heads_are_busy(self):
+        for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+            with self.subTest(marker=name):
+                marker = self._git_dir() / name
+                marker.write_text("deadbeef\n")
+                try:
+                    self.assertTrue(sync._busy(str(self.repo)))
+                finally:
+                    marker.unlink()
+
+
 class TransientPaths(unittest.TestCase):
     """`.hermes-tmp.*` temps must never reach `git add` — one stale pathspec
     fails the whole add batch and the real changes of the turn never commit."""
