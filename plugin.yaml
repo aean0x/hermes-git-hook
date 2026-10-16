@@ -1,5 +1,5 @@
 name: git-hook
-version: 0.5.1
+version: 0.5.2
 description: >-
   Auto fetch/pull before reads, and commit + push only the files this turn
   changed, for any git worktree Hermes touches. Stale paths (atomic-write
@@ -13,10 +13,13 @@ description: >-
   hook drops its own unpushed commit, leaves the edit staged and dirty, and
   reports it once, instead of stranding commits that can never push and
   re-logging the same remote error every pass. The plugin install
-  tree itself is never synced. Failures surface in-session (not log-only);
-  busy/push-fail retries. Git subprocesses never run under the module lock,
-  so one session's slow pull/porcelain cannot stall every session's
-  post_tool_call hook (prevents "skipped after previous timeout" cascades).
+  tree itself is never synced. Failures surface in-session, not log-only: a
+  note a turn-end flush produces is held and delivered by pre_llm_call at
+  the next turn start, the seam Hermes injects into the conversation (it
+  discards a post_llm_call return value); busy/push-fail retries. Git
+  subprocesses never run under the module lock, so one session's slow
+  pull/porcelain cannot stall every session's post_tool_call hook
+  (prevents "skipped after previous timeout" cascades).
   The agent's own secrets, state, caches and logs are never staged.
   No tools, no scripts. Disable commits with GIT_HOOK_COMMIT=0, push with
   GIT_HOOK_PUSH=0.
@@ -25,5 +28,6 @@ kind: standalone
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+  - pre_llm_call
   - post_llm_call
   - on_session_end

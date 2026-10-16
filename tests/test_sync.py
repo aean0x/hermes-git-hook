@@ -265,7 +265,13 @@ class GitSync(unittest.TestCase):
         names = [c.args[0] for c in ctx.register_hook.call_args_list]
         self.assertEqual(
             names,
-            ["pre_tool_call", "post_tool_call", "post_llm_call", "on_session_end"],
+            [
+                "pre_tool_call",
+                "post_tool_call",
+                "pre_llm_call",
+                "post_llm_call",
+                "on_session_end",
+            ],
         )
 
     def test_busy_preserves_dirty_and_surfaces(self):
@@ -276,10 +282,14 @@ class GitSync(unittest.TestCase):
         target.write_text("ours\n")
         sync.on_post_tool_call("write_file", {"path": str(target)}, status="ok")
         (work / ".git" / "MERGE_HEAD").write_text("deadbeef\n")
-        result = sync.on_post_llm_call()
+        # The turn-end seam only flushes; the host discards what it returns.
+        self.assertIsNone(sync.on_post_llm_call())
+        result = sync.on_pre_llm_call()
         self.assertIsNotNone(result)
         self.assertIn("busy", result["context"])
         self.assertTrue(sync._dirty.get(_key(work)))
+        # Delivered once: the next turn start has nothing left to inject.
+        self.assertIsNone(sync.on_pre_llm_call())
 
     def test_commit_skip_is_warning_status(self):
         _, work = self._clone_pair()
@@ -303,11 +313,13 @@ class GitSync(unittest.TestCase):
         target.write_text("ours\n")
         sync.on_post_tool_call("write_file", {"path": str(target)}, status="ok")
         _git(["remote", "set-url", "origin", str(self.root / "missing.git")], cwd=work)
-        result = sync.on_post_llm_call()
+        self.assertIsNone(sync.on_post_llm_call())
+        result = sync.on_pre_llm_call()
         self.assertIsNotNone(result)
         self.assertIn("push failed", result["context"])
         self.assertIn(_key(work), sync._unpushed)
-        again = sync.on_post_llm_call()
+        self.assertIsNone(sync.on_post_llm_call())
+        again = sync.on_pre_llm_call()
         self.assertIsNotNone(again)
         self.assertIn("push failed", again["context"])
         self.assertIn(_key(work), sync._unpushed)
@@ -543,6 +555,78 @@ class SessionScopedState(unittest.TestCase):
         self.assertEqual(sync.pull_if_clean(str(self.work), "sess-a"), "pulled")
         self.assertEqual(sync.pull_if_clean(str(self.work), "sess-a"), "already")
         self.assertEqual(sync.pull_if_clean(str(self.work), "sess-b"), "pulled")
+
+
+class NoteDelivery(unittest.TestCase):
+    """A flush note must reach the session that produced it, and only it.
+
+    The turn-end flush runs on `post_llm_call`, whose return value the host
+    discards (`agent/turn_finalizer.py`); the note is therefore held and handed
+    to `pre_llm_call`, the seam `agent/turn_context.py` injects into the next
+    user message. These tests pin that path and its two properties: delivery is
+    one-shot, and it is per session.
+    """
+
+    def setUp(self):
+        sync.reset_state()
+        self.td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self.td.name)
+        os.environ["PROJECTS_ROOT"] = str(self.root)
+        origin = _init_repo(self.root / "origin")
+        self.work = self.root / "work"
+        _git(["clone", str(origin), str(self.work)], cwd=self.root)
+        _git(["config", "user.name", "dev"], cwd=self.work)
+        _git(["config", "user.email", "dev@example.com"], cwd=self.work)
+        # A remote that cannot land the push, so every flush produces a note
+        # without needing a policy-protected branch.
+        _git(
+            ["remote", "set-url", "origin", str(self.root / "missing.git")],
+            cwd=self.work,
+        )
+
+    def tearDown(self):
+        sync.reset_state()
+        os.environ.pop("PROJECTS_ROOT", None)
+        self.td.cleanup()
+
+    def _turn(self, session: str, name: str) -> None:
+        target = self.work / name
+        sync.on_pre_tool_call("write_file", {"path": str(target)}, session_id=session)
+        target.write_text(f"from {session}\n")
+        sync.on_post_tool_call(
+            "write_file", {"path": str(target)}, status="ok", session_id=session
+        )
+
+    def test_note_is_held_at_turn_end_and_delivered_at_the_next_turn_start(self):
+        self._turn("sess-a", "a.txt")
+
+        # The host drops this hook's return value, so the note cannot ride it.
+        self.assertIsNone(sync.on_post_llm_call(session_id="sess-a"))
+
+        delivered = sync.on_pre_llm_call(session_id="sess-a")
+        self.assertIsNotNone(delivered)
+        self.assertIn("push failed", delivered["context"])
+        self.assertIn("git-hook:", delivered["context"])
+
+        # One-shot: the next turn start has nothing left to inject.
+        self.assertIsNone(sync.on_pre_llm_call(session_id="sess-a"))
+
+    def test_a_note_never_crosses_sessions(self):
+        self._turn("sess-a", "a.txt")
+        sync.on_post_llm_call(session_id="sess-a")
+
+        self.assertIsNone(sync.on_pre_llm_call(session_id="sess-b"))
+        self.assertIsNotNone(sync.on_pre_llm_call(session_id="sess-a"))
+
+    def test_two_flushes_join_into_one_delivery(self):
+        self._turn("sess-a", "a.txt")
+        sync.on_post_llm_call(session_id="sess-a")
+        self._turn("sess-a", "b.txt")
+        sync.on_post_llm_call(session_id="sess-a")
+
+        delivered = sync.on_pre_llm_call(session_id="sess-a")
+        self.assertIsNotNone(delivered)
+        self.assertEqual(delivered["context"].count("git-hook:"), 2)
 
 
 class PullBudget(unittest.TestCase):
@@ -797,18 +881,24 @@ class ProtectedBranch(unittest.TestCase):
         target.write_text("ours\n")
         sync.on_post_tool_call("write_file", {"path": str(target)}, status="ok")
 
-        first = sync.on_post_llm_call()
+        # The refusal is reported at the NEXT turn start: the turn-end flush
+        # runs on a hook whose return value the host discards.
+        self.assertIsNone(sync.on_post_llm_call())
+
+        first = sync.on_pre_llm_call()
 
         self.assertIsNotNone(first)
         self.assertIn("rejects direct pushes to main", first["context"])
         self.assertIn("touched.txt", first["context"])
+        self.assertIsNone(sync.on_pre_llm_call())  # delivered once
 
         more = self.work / "more.txt"
         sync.on_pre_tool_call("write_file", {"path": str(more)})
         more.write_text("more\n")
         sync.on_post_tool_call("write_file", {"path": str(more)}, status="ok")
 
-        self.assertIsNone(sync.on_post_llm_call())  # one warning, not one per turn
+        sync.on_post_llm_call()
+        self.assertIsNone(sync.on_pre_llm_call())  # one warning, not one per turn
         self.assertEqual(self._attempts(), 1)
 
     def test_stranded_commits_stop_being_retried(self):
@@ -820,13 +910,16 @@ class ProtectedBranch(unittest.TestCase):
         _git(["commit", "-m", "stranded"], cwd=self.work)
         sync._unpushed.add(("", str(self.work)))
 
-        first = sync.on_post_llm_call()
+        sync.on_post_llm_call()
+
+        first = sync.on_pre_llm_call()
 
         self.assertIsNotNone(first)
         self.assertIn("a local commit stays unpushed", first["context"])
         self.assertEqual(self._attempts(), 1)
 
-        self.assertIsNone(sync.on_post_llm_call())
+        sync.on_post_llm_call()
+        self.assertIsNone(sync.on_pre_llm_call())
         self.assertEqual(self._attempts(), 1)
 
     def test_undo_refuses_to_touch_a_commit_it_did_not_make(self):
