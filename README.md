@@ -15,11 +15,14 @@ agent works in honest:
   committing on that branch, and say so once — instead of stranding commits
   that can never be pushed.
 
-Failure is not silent, and it is not published a second way: a busy index, a
-hook rejection, a failed or timed-out push is written to the log, the paths stay
-queued for a retry, and the plugin also returns a note from its turn-end and
-session-end hooks. Hermes currently discards hook return values, so the log is
-where those notes actually surface.
+Failure is not silent: a busy index, a hook rejection, a failed or timed-out
+push is written to the log, the paths stay queued for a retry, and the plugin
+also produces an operator note. The note is held when the turn-end flush
+creates it and delivered by `pre_llm_call` at the start of the session's next
+turn — the one seam Hermes injects into the conversation, so the agent reads it
+while it can still act. (`post_llm_call` is where the flush runs, but the
+agent's turn finalizer discards that hook's return value; a note returned there
+reaches nobody.) Each note is delivered once.
 
 State is per session: two sessions in one repository never share a batch, so one
 session's flush cannot publish the other session's half-finished edit.
@@ -93,7 +96,9 @@ commit can never be pushed, and neither can any later one. The hook:
    in the working tree and visible in `git status`;
 2. stops committing on that branch for the rest of the process, leaving later
    edits dirty too;
-3. says so once per branch, in-session:
+3. says so once per branch: the note is held from that flush and injected into
+   the session at the start of the next turn (`pre_llm_call`), the seam the
+   agent reads before it acts —
    `repo: origin rejects direct pushes to main (a PR is required) — git-hook
    left sync.py uncommitted and pushed nothing. Put them on a branch and open
    a PR.`
@@ -124,7 +129,7 @@ python -m unittest discover -s tests -t . -v
 
 The suite is in-process: it builds throwaway repositories under a temp dir and
 drives the real code paths (`_skipped`, `commit_and_push`, `_push`, the
-transient-path filter). No network access.
+transient-path filter, and the `pre_llm_call` note delivery). No network access.
 
 ## License
 

@@ -3,7 +3,9 @@
 pre_tool_call  — ff-only pull on first read of a clean repo (before the
                  tool result reaches the model).
 post_tool_call — record porcelain delta (only files this turn changed).
-post_llm_call / on_session_end — commit those paths and push.
+post_llm_call / on_session_end — commit those paths and push; hold the note.
+pre_llm_call   — hand that note to the session, once (the only seam whose
+                 return the host injects; a post_llm_call return is dropped).
 
 Fail-open everywhere. Never registers a tool. Never shells a sidecar.
 """
@@ -113,6 +115,15 @@ _protected: Set[Tuple[str, str]] = set()
 # (root, branch) already reported to the operator by this process: the warning
 # is per branch, not per flush.
 _policy_noted: Set[Tuple[str, str]] = set()
+# Notes a turn-end flush produced, held per session until that session's next
+# turn starts. A `post_llm_call` return value is DISCARDED by the host
+# (`agent/turn_finalizer.py` fires the hook and assigns its results to
+# nothing), so the plugin's "says so in-session" promise died at that seam. The
+# host DOES consume `pre_llm_call` context (`agent/turn_context.py`
+# `_collect_pre_llm_call_context` joins it into the next user message), so a
+# note is held here and delivered once, at the start of the next turn — the
+# earliest moment the agent can still act on it.
+_notes_held: Dict[str, str] = {}
 
 # Flush outcomes that must put paths back on _dirty (commit never landed).
 _RETRY_DIRTY = frozenset(
@@ -1000,6 +1011,23 @@ def _may_note(root: str, status: str) -> bool:
     return _note_policy_once(root, _status_branch(status))
 
 
+def _hold_note(session_id: str, body: str) -> None:
+    """Queue a flush note for this session's next turn.
+
+    Turns in one session can produce several notes (a busy repo, then a refused
+    push); they are joined so one delivery carries all of them.
+    """
+    with _lock:
+        held = _notes_held.get(session_id)
+        _notes_held[session_id] = f"{held}\n\n{body}" if held else body
+
+
+def _take_note(session_id: str) -> Optional[str]:
+    """Pop this session's held note: delivery is one-shot."""
+    with _lock:
+        return _notes_held.pop(session_id, None)
+
+
 def _flush(source: str, session_id: str = "") -> Optional[str]:
     """Commit and push this session's queued paths only.
 
@@ -1065,12 +1093,32 @@ def _flush(source: str, session_id: str = "") -> Optional[str]:
     return "git-hook:\n" + "\n".join(f"- {n}" for n in notes)
 
 
-def on_post_llm_call(
-    session_id: str = "", **kwargs: Any
-) -> Optional[Dict[str, str]]:
+def on_post_llm_call(session_id: str = "", **kwargs: Any) -> None:
+    """Commit and push the turn's paths; hold any note for the next turn.
+
+    Never returns the note: the host discards this hook's result (its turn
+    finalizer fires ``post_llm_call`` and drops what it returns), so a note
+    returned here reaches nobody. It is held for ``on_pre_llm_call`` instead.
+    """
     if kwargs.get("error"):
-        return None
+        return
     body = _flush("post_llm_call", session_id)
+    if body:
+        _hold_note(session_id, body)
+
+
+def on_pre_llm_call(
+    session_id: str = "", **_kwargs: Any
+) -> Optional[Dict[str, str]]:
+    """Deliver the note a previous turn's flush held, once per note.
+
+    This is the seam the host consumes: it joins ``{"context": ...}`` from
+    ``pre_llm_call`` into the next user message, so the agent learns its commit
+    was dropped and why while it can still move the edit to a branch. A policy
+    note is produced at most once per branch per process (``_may_note``), and
+    taking it here clears it, so no note is delivered twice.
+    """
+    body = _take_note(session_id)
     if body:
         return {"context": body}
     return None
@@ -1082,6 +1130,10 @@ def on_session_end(session_id: str = "", **kwargs: Any) -> Optional[Dict[str, st
         return None
     body = _flush(f"on_session_end:{reason or 'unknown'}", session_id)
     if body:
+        # No later turn of this run exists to inject into: hold it as well, so a
+        # session resumed in this process still gets it at its next turn start,
+        # and return it for any consumer that reads session-end results.
+        _hold_note(session_id, body)
         return {"context": body}
     return None
 
@@ -1096,11 +1148,13 @@ def reset_state() -> None:
         _root_cache.clear()
         _protected.clear()
         _policy_noted.clear()
+        _notes_held.clear()
 
 
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("on_session_end", on_session_end)
     log.info("git-hook: registered (in-process, any worktree)")
